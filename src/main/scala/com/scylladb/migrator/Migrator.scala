@@ -255,32 +255,35 @@ object Migrator {
     val connector = Connectors.targetConnector(spark.sparkContext.getConf, target)
     val writeConf = WriteConf.fromSparkConf(spark.sparkContext.getConf)
 
+    val drops = renames.filter(_.to == "_DROP").map(_.from)
+    val droppedDF = df.drop(drops: _*)
+
     val transformedDF = copyType match {
       case CopyType.WithTimestampPreservation =>
         val (primaryKeyOrdinals, regularKeyOrdinals) = indexFields(
-          df.schema.fields.map(_.name).toList,
-          origSchema.fields.map(_.name).toList,
+          droppedDF.schema.fields.map(_.name).toList,
+          origSchema.fields.map(_.name).filterNot(drops.contains).toList,
           tableDef)
 
         val broadcastPrimaryKeyOrdinals = spark.sparkContext.broadcast(primaryKeyOrdinals)
         val broadcastRegularKeyOrdinals = spark.sparkContext.broadcast(regularKeyOrdinals)
         val broadcastSchema = spark.sparkContext.broadcast(origSchema)
         val finalSchema = StructType(
-          origSchema.fields ++
+          origSchema.fields.filterNot(x => drops.contains(x.name)) ++
             Seq(StructField("ttl", LongType, true), StructField("writetime", LongType, true))
         )
 
         log.info("Schema that'll be used for writing to Scylla:")
         log.info(finalSchema.treeString)
 
-        df.flatMap {
+        droppedDF.flatMap {
           explodeRow(
             _,
             broadcastSchema.value,
             broadcastPrimaryKeyOrdinals.value,
             broadcastRegularKeyOrdinals.value)
         }(RowEncoder(finalSchema))
-      case CopyType.NoTimestampPreservation => df
+      case CopyType.NoTimestampPreservation => droppedDF
     }
 
     // Similarly to createDataFrame, when using withColumnRenamed, Spark tries
@@ -296,23 +299,24 @@ object Migrator {
     log.info("Schema after renames:")
     log.info(renamedSchema.treeString)
 
-    transformedDF.rdd.saveToCassandra(
-      target.keyspace,
-      target.table,
-      SomeColumns(
-        renamedSchema.fields
-          .map(x => x.name: ColumnRef)
-          .filterNot(ref => ref.columnName == "ttl" || ref.columnName == "writetime"): _*),
-      copyType match {
-        case CopyType.WithTimestampPreservation =>
-          writeConf.copy(
-            ttl       = TTLOption.perRow("ttl"),
-            timestamp = TimestampOption.perRow("writetime")
-          )
-        case CopyType.NoTimestampPreservation => writeConf
-      },
-      tokenRangeAccumulator = Some(tokenRangeAccumulator)
-    )(connector, SqlRowWriter.Factory)
+    transformedDF.rdd
+      .saveToCassandra(
+        target.keyspace,
+        target.table,
+        SomeColumns(
+          renamedSchema.fields
+            .map(x => x.name: ColumnRef)
+            .filterNot(ref => ref.columnName == "ttl" || ref.columnName == "writetime"): _*),
+        copyType match {
+          case CopyType.WithTimestampPreservation =>
+            writeConf.copy(
+              ttl       = TTLOption.perRow("ttl"),
+              timestamp = TimestampOption.perRow("writetime")
+            )
+          case CopyType.NoTimestampPreservation => writeConf
+        },
+        tokenRangeAccumulator = Some(tokenRangeAccumulator)
+      )(connector, SqlRowWriter.Factory)
   }
 
   def main(args: Array[String]): Unit = {
